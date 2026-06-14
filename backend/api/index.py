@@ -25,6 +25,14 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+
+@app.middleware("http")
+async def add_server_id_header(request, call_next):
+    response = await call_next(request)
+    response.headers["X-Server-ID"] = str(config.SERVER_ID)
+    return response
+
+
 # Register routes. Note: links router must be included BEFORE redirect router
 # so that the general /{code} wildcard doesn't hijack /shorten or /analytics/{code}
 app.include_router(links.router)
