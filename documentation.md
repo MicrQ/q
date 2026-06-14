@@ -1,4 +1,4 @@
-# Q — Distributed URL Shortener: System Design
+# Q — A lightweight, distributed URL shortening service: System Design
 
 ## Overview
 
