@@ -1,0 +1,8 @@
+**/.venv
+**/.env
+**/node_modules
+**/__pycache__
+**.pyc
+**/.claude
+**/.agents
+**/AGENTS.md
