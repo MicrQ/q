@@ -7,7 +7,7 @@ from fastapi import APIRouter, HTTPException, Request, status
 
 from app import db, cache, config
 from app.snowflake import SnowflakeGenerator
-from app.models import ShortenRequest, ShortenResponse, AnalyticsResponse
+from app.models import ShortenRequest, ShortenResponse, AnalyticsResponse, ErrorResponse
 
 router = APIRouter()
 snowflake = SnowflakeGenerator(config.SERVER_ID)
@@ -16,7 +16,12 @@ snowflake = SnowflakeGenerator(config.SERVER_ID)
     "/shorten",
     response_model=ShortenResponse,
     status_code=status.HTTP_201_CREATED,
-    summary="Shorten a long URL"
+    summary="Shorten a long URL",
+    description="Generate a short code for the given URL. Returns the code, the full short URL, and the expiry timestamp.",
+    responses={
+        422: {"model": ErrorResponse, "description": "Invalid URL or expiry date is in the past."},
+        500: {"model": ErrorResponse, "description": "Database error."},
+    },
 )
 async def shorten(request: Request, body: ShortenRequest):
     # Set default expiry of 1 year if not provided
@@ -77,7 +82,11 @@ async def shorten(request: Request, body: ShortenRequest):
 @router.get(
     "/analytics/{code}",
     response_model=AnalyticsResponse,
-    summary="Get analytics for a short code"
+    summary="Get analytics for a short code",
+    description="Returns the original URL, total click count, and timestamps for the given short code.",
+    responses={
+        404: {"model": ErrorResponse, "description": "Short code not found."},
+    },
 )
 async def get_analytics(code: str):
     record = await db.get_link(code)

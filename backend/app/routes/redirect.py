@@ -12,7 +12,7 @@ router = APIRouter()
 
 @router.get(
     "/{code}",
-    summary="Redirect short URL to original URL"
+    include_in_schema=False,
 )
 async def redirect(code: str):
     now = datetime.now(timezone.utc)

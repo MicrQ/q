@@ -38,7 +38,7 @@ async def add_server_id_header(request, call_next):
 app.include_router(links.router)
 
 
-@app.get("/health", summary="Health check endpoint")
+@app.get("/health", include_in_schema=False)
 async def health():
     return {"status": "healthy", "server_id": config.SERVER_ID}
 
