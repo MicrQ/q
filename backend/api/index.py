@@ -33,12 +33,15 @@ async def add_server_id_header(request, call_next):
     return response
 
 
-# Register routes. Note: links router must be included BEFORE redirect router
-# so that the general /{code} wildcard doesn't hijack /shorten or /analytics/{code}
+# Register routes. Note: links router and health check must be included BEFORE redirect router
+# so that the general /{code} wildcard doesn't hijack /shorten, /analytics/{code}, or /health
 app.include_router(links.router)
-app.include_router(redirect.router)
 
 
 @app.get("/health", summary="Health check endpoint")
 async def health():
     return {"status": "healthy", "server_id": config.SERVER_ID}
+
+
+app.include_router(redirect.router)
+

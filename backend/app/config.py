@@ -10,7 +10,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # --- Server identity ---
-SERVER_ID: int = int(os.environ["SERVER_ID"])
+SERVER_ID: int = int(os.environ.get("SERVER_ID", "1"))
+
 
 # --- Postgres ---
 POSTGRES_HOST: str = os.environ.get("POSTGRES_HOST", "localhost")
