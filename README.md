@@ -12,27 +12,33 @@ A distributed URL shortening service built with FastAPI, Redis, Postgres, and Ng
               round-robin│
           ┌──────────────┼──────────────┐
           ▼              ▼              ▼
-     ┌─────────┐   ┌─────────┐   ┌─────────┐
-     │ API  1  │   │ API  2  │   │ API  3  │
-     │ :8000   │   │ :8000   │   │ :8000   │
-     └────┬────┘   └────┬────┘   └────┬────┘
+     ┌──────────┐  ┌──────────┐  ┌──────────┐
+     │  API  1  │  │  API  2  │  │  API  3  │
+     │ :8000    │  │ :8000    │  │ :8000    │
+     │+ratelimit│  │+ratelimit│  │+ratelimit│
+     └────┬─────┘  └────┬─────┘  └────┬─────┘
           │              │              │
-     ┌────┴──────────────┴──────────────┴────┐
-     │         Consistent Hash Ring          │
-     ├───────────────┬──────────────────────┤
-     ▼               ▼                       │
-┌─────────┐   ┌─────────┐              ┌────┴─────┐
-│ Redis 1 │   │ Redis 2 │              │ Postgres │
-│ (cache  │   │ (cache) │              │  (store) │
-│ +stream)│   │         │              └──────────┘
-└────┬────┘   └─────────┘
-     │ clicks stream
-     ▼
-┌──────────┐
-│ Consumer │
-│ (batch   │
-│  writer) │
-└──────────┘
+          └──────────────┼──────────────┘
+                         │
+          ┌──────────────┴──────────────┐
+          │  Consistent Hash Ring       │
+          │  (URL cache + rate-limit)   │
+          ├──────────────┬──────────────┤
+          ▼              ▼
+     ┌──────────┐  ┌──────────┐
+     │ Redis 1  │  │ Redis 2  │
+     │ (cache   │  │ (cache)  │
+     │ +stream) │  │          │
+     │+ratelimit│  │+ratelimit│
+     └────┬─────┘  └──────────┘
+          │
+          │ clicks stream        ┌──────────┐
+          ▼                      │ Postgres │
+     ┌──────────┐                │  (store) │
+     │ Consumer │◄─── (read/write───────────┘
+     │ (batch   │     direct,
+     │  writer) │     not hashed)
+     └──────────┘
 ```
 
 **Key design decisions:**
@@ -40,6 +46,7 @@ A distributed URL shortening service built with FastAPI, Redis, Postgres, and Ng
 - **Snowflake IDs** — each API node generates collision-free short codes using a timestamp + server ID + sequence scheme. No coordination needed.
 - **Consistent hashing** — cache lookups are routed to the correct Redis node deterministically. Adding a node only remaps ~1/N of keys.
 - **Click stream** — redirects publish to a Redis Stream; a standalone consumer batches writes to Postgres. This keeps redirect latency low.
+- **Rate limiting** — per-IP sliding window counters distributed across all Redis nodes via the consistent hash ring. No single point of failure.
 
 ## Quickstart
 
@@ -102,6 +109,32 @@ curl http://localhost/analytics/2GxKp8mN
 }
 ```
 
+## Rate Limiting
+
+Every endpoint (except `/health`) enforces per-IP rate limits using a sliding window counter stored in Redis. Limits are distributed across both Redis nodes via consistent hashing on the client IP — no single point of failure.
+
+| Endpoint | Limit |
+|---|---|
+| `POST /shorten` | 10 requests per minute |
+| `GET /analytics/{code}` | 600 requests per minute |
+| `GET /{code}` (redirect) | 6000 requests per minute |
+
+All responses include rate-limit headers:
+
+```http
+X-RateLimit-Limit: 10
+X-RateLimit-Remaining: 5
+X-RateLimit-Reset: 42
+```
+
+When the limit is exceeded, a **429 Too Many Requests** is returned:
+
+```json
+{
+  "detail": "Too many requests. Please try again later."
+}
+```
+
 ## Tests
 
 Requires [uv](https://docs.astral.sh/uv/) for dependency management.
@@ -136,6 +169,7 @@ backend/
 │   ├── cache.py               # Redis client pool + consistent hash ring
 │   ├── db.py                  # Postgres via asyncpg
 │   ├── models.py              # Pydantic request/response schemas
+│   ├── ratelimit.py           # Per-IP sliding window rate limiter
 │   ├── snowflake.py           # Distributed ID generator
 │   └── routes/
 │       ├── links.py           # POST /shorten, GET /analytics/{code}

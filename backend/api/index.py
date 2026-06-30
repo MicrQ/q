@@ -4,8 +4,9 @@ FastAPI application entry point.
 
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 
-from app import db, cache, config
+from app import db, cache, config, ratelimit
 from app.routes import links, redirect
 
 
@@ -24,6 +25,42 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan
 )
+
+
+@app.middleware("http")
+async def rate_limit_middleware(request, call_next):
+    """Enforce per-IP sliding-window rate limits using Redis."""
+    # Exempt health checks from rate limiting
+    if request.url.path == "/health":
+        return await call_next(request)
+
+    ip = ratelimit.get_client_ip(
+        dict(request.headers),
+        request.client.host if request.client else None,
+    )
+    _prefix, cfg = ratelimit.resolve_config(request.url.path)
+
+    allowed, remaining, reset_in = await ratelimit.check_rate_limit(
+        ip, cfg.limit, cfg.window_seconds
+    )
+
+    if not allowed:
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "Too many requests. Please try again later."},
+            headers={
+                "X-RateLimit-Limit": str(cfg.limit),
+                "X-RateLimit-Remaining": "0",
+                "X-RateLimit-Reset": str(reset_in),
+                "Retry-After": str(reset_in),
+            },
+        )
+
+    response = await call_next(request)
+    response.headers["X-RateLimit-Limit"] = str(cfg.limit)
+    response.headers["X-RateLimit-Remaining"] = str(remaining)
+    response.headers["X-RateLimit-Reset"] = str(reset_in)
+    return response
 
 
 @app.middleware("http")

@@ -25,34 +25,39 @@ Q is a production-grade, distributed URL shortening service designed for high th
                         └────────┬────────┘
                ┌─────────────────┼─────────────────┐
                ▼                 ▼                 ▼
-        ┌────────────┐   ┌────────────┐   ┌────────────┐
-        │  FastAPI   │   │  FastAPI   │   │  FastAPI   │
-        │ Server 1   │   │ Server 2   │   │ Server 3   │
-        │ (id=1)     │   │ (id=2)     │   │ (id=3)     │
-        └─────┬──────┘   └─────┬──────┘   └─────┬──────┘
-              └────────────────┼─────────────────┘
-                               │
-              ┌────────────────┴──────────────────────┐
-              ▼                                        ▼
-       ┌─────────────┐                        ┌─────────────┐
-       │   Redis 1   │◄── click stream        │   Redis 2   │
-       │  (cache +   │    (clicks stream       │  (cache)    │
-       │   stream)   │     lives here)         └─────────────┘
-       └──────┬──────┘
-              │                    ┌─────────────────────┐
-              │ (XREAD)            │   Click Consumer    │
-              └───────────────────►│  (standalone proc)  │
-                                   └──────────┬──────────┘
-                                              │ UPDATE clicks
-                                              ▼
-                                   ┌─────────────────────┐
-                                   │      Postgres       │
-                                   └─────────────────────┘
-                                              ▲
-                               (cache miss fallback + writes)
-              ┌────────────────────────────────────────────┐
-              │           All FastAPI Servers              │
-              └────────────────────────────────────────────┘
+        ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+        │   FastAPI    │ │   FastAPI    │ │   FastAPI    │
+        │  Server 1    │ │  Server 2    │ │  Server 3    │
+        │  (id=1)      │ │  (id=2)      │ │  (id=3)      │
+        │ +ratelimit   │ │ +ratelimit   │ │ +ratelimit   │
+        │  middleware  │ │  middleware  │ │  middleware  │
+        └──────┬───────┘ └──────┬───────┘ └──────┬───────┘
+               └────────────────┼─────────────────┘
+                                │
+               ┌────────────────┴────────────────────────────────┐
+               │  Consistent Hash Ring (URL cache + rate-limit)  │
+               ├────────────────────────┬────────────────────────┤
+               ▼                        ▼
+        ┌──────────────┐       ┌──────────────┐
+        │   Redis 1    │       │   Redis 2    │
+        │  (cache +    │       │  (cache)     │
+        │   stream)    │       │ +ratelimit   │
+        │ +ratelimit   │       └──────────────┘
+        └──────┬───────┘
+               │                     ┌──────────────────────┐
+               │  (XREAD)            │   Click Consumer     │
+               └────────────────────►│  (standalone proc)   │
+                                     └──────────┬───────────┘
+                                                │ UPDATE clicks
+                                                ▼
+                                     ┌──────────────────────┐
+                                     │      Postgres        │
+                                     └──────────────────────┘
+                                                ▲
+                                 (cache miss fallback + writes)
+                ┌──────────────────────────────────────────────────┐
+                │           All FastAPI Servers                    │
+                └──────────────────────────────────────────────────┘
 ```
 
 ---
@@ -79,6 +84,15 @@ Q is a production-grade, distributed URL shortening service designed for high th
 - On write (POST /shorten): server pre-populates the correct Redis node immediately after writing to Postgres
 - On read (GET /{code}): server queries the correct Redis node first; on miss, falls back to Postgres and repopulates Redis
 - `redis_1` also hosts the `clicks` Redis Stream used for async click counting
+- Both nodes also serve rate-limit counters, distributed via the same consistent hash ring but keyed on client IP
+
+### Rate Limiter (FastAPI Middleware)
+- Per-IP sliding window rate limiter implemented as a FastAPI middleware in `app/ratelimit.py`
+- Uses the **same consistent hash ring** as the URL cache to distribute `rl:{ip}:{window}` counters across all Redis nodes — no single point of failure
+- Three tiers with different limits: `POST /shorten` (10 req/min), `GET /analytics/{code}` (600 req/min), `GET /{code}` (6000 req/min)
+- Responds with **429 Too Many Requests** and rate-limit headers (`X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`, `Retry-After`)
+- **Fails open** — if Redis is unreachable, logs a warning and lets the request through rather than blocking all traffic
+- `/health` endpoint is exempt from rate limiting
 
 ### Click Consumer (Standalone Process)
 - A single long-running Python process that reads from the `clicks` stream on `redis_1`
@@ -130,6 +144,28 @@ On cache miss (key expired or evicted):
 - Default `expires_at` = `created_at + 1 year`
 - On redirect: check `expires_at` against current time in application code (from cached value or Postgres fallback) → 410 Gone if expired
 - No background pruning; expired links remain in Postgres until manually cleaned
+
+### Sliding Window Rate Limiter (Redis-Backed)
+Every API request (except `/health`) goes through a rate limiter middleware that enforces per-IP limits using a sliding window counter algorithm.
+
+**Algorithm:**
+Two fixed-window counters per IP per endpoint tier. The estimated count for the current instant is:
+
+```
+estimated = prev_count * (1 - elapsed_ratio) + curr_count
+```
+
+This gives a smooth approximation of a true sliding window with only **2 Redis keys per IP**, vs O(N) for a sorted-set approach.
+
+**Distribution:**
+Rate-limit keys are hashed by client IP onto the consistent hash ring — the same ring used for the URL cache. This distributes rate-limit state across both Redis nodes. If `redis_1` goes down, only IPs whose rate-limit keys live on `redis_1` lose their limit state (~50%); those requests fail open, while the other ~50% continue to be rate-limited normally. No single point of failure.
+
+**Headers on every response:**
+```
+X-RateLimit-Limit: 10
+X-RateLimit-Remaining: 5
+X-RateLimit-Reset: 42
+```
 
 ### Redis Streams for Click Counting
 On every successful redirect, the handling FastAPI server does:
@@ -204,6 +240,7 @@ q/backend/
 ├── app/
 │   ├── db.py                   # Postgres client
 │   ├── cache.py                # Redis client with consistent hashing + stream producer
+│   ├── ratelimit.py            # Per-IP sliding window rate limiter middleware logic
 │   ├── snowflake.py            # Unique ID generator
 │   ├── models.py               # Pydantic schemas
 │   └── routes/
